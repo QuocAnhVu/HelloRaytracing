@@ -1,9 +1,13 @@
-use std::{cmp, f32::consts::TAU, fs::File, io, rc::Rc};
+mod material;
+
+use std::{f32::consts::TAU, fs::File, io};
 
 use glam::Vec3;
 use indicatif::ProgressBar;
 use itertools::{self, Itertools};
+use material::Material;
 use rand::{distributions::Uniform, thread_rng, Rng};
+use rayon::prelude::*;
 
 type Color = Vec3;
 const WHITE: Color = Color::new(1.0, 1.0, 1.0);
@@ -15,35 +19,22 @@ fn main() -> io::Result<()> {
     scene.add(Sphere {
         transl: Vec3::new(0.0, -100.5, -1.0),
         radius: 100.0,
-        mat: Rc::new(Lambertian {
-            albedo: Color::new(0.8, 0.8, 0.0),
-        }),
+        mat: Material::lambertian(Color::new(0.8, 0.8, 0.0)),
     });
     scene.add(Sphere {
         transl: Vec3::new(0.0, 0.0, -1.2),
         radius: 0.5,
-        mat: Rc::new(Lambertian {
-            albedo: Color::new(0.1, 0.2, 0.5),
-        }),
+        mat: Material::lambertian(Color::new(0.1, 0.2, 0.5)),
     });
     scene.add(Sphere {
         transl: Vec3::new(-1.0, 0.0, -1.0),
         radius: 0.5,
-        mat: Rc::new(Dielectric {
-            refraction_index: 1.0 / 1.33,
-        }),
-        // mat: Rc::new(Metallic {
-        //     albedo: Color::new(0.8, 0.8, 0.8),
-        //     fuzz: 0.3,
-        // }),
+        mat: Material::dielectric(1.0 / 1.33),
     });
     scene.add(Sphere {
         transl: Vec3::new(1.0, 0.0, -1.0),
         radius: 0.5,
-        mat: Rc::new(Metallic {
-            albedo: Color::new(0.8, 0.6, 0.2),
-            fuzz: 1.0,
-        }),
+        mat: Material::metallic(Color::new(0.8, 0.6, 0.2), 1.0),
     });
 
     // Define camera
@@ -58,12 +49,12 @@ fn main() -> io::Result<()> {
         (Camera::IMG_HEIGHT * Camera::IMG_WIDTH * Camera::SAMPLES_PER_PIXEL) as u64,
     );
     let mut colors: Vec<(Pixel, Color)> = pixels
+        .par_bridge()
         .map(|pixel| (pixel, camera.render(&scene, pixel)))
         .map(|x| {
             bar.inc(Camera::SAMPLES_PER_PIXEL as u64);
             x
         })
-        // .par_bridge()
         .collect();
     colors.sort_unstable_by_key(|(Pixel(i, j), _)| (*j, *i));
 
@@ -122,14 +113,11 @@ struct Camera {
     pixel_origin: Vec3,
     pixel_du: Vec3,
     pixel_dv: Vec3,
-    u: Vec3,
-    v: Vec3,
-    w: Vec3,
 }
 impl Camera {
-    const IMG_HEIGHT: u32 = 256;
-    const IMG_WIDTH: u32 = 1024;
-    const SAMPLES_PER_PIXEL: u32 = 8;
+    const IMG_HEIGHT: u32 = 1080;
+    const IMG_WIDTH: u32 = 1920;
+    const SAMPLES_PER_PIXEL: u32 = 256;
     const VERTICAL_FOV: f32 = TAU / 8.0;
 
     fn new(look_from: Vec3, look_at: Vec3, up: Vec3) -> Self {
@@ -162,9 +150,6 @@ impl Camera {
             pixel_origin,
             pixel_du,
             pixel_dv,
-            u,
-            v,
-            w,
         }
     }
 
@@ -177,20 +162,22 @@ impl Camera {
         const MAX_DEPTH: u32 = 64;
 
         let Pixel(i, j) = pixel;
-        let mut rng = thread_rng();
         let offset = Uniform::new(-0.5, 0.5);
-        let mut pixel_color = BLACK;
-        for _ in 0..Self::SAMPLES_PER_PIXEL {
-            let pixel_center = self.pixel_origin
-                + ((i as f32 + rng.sample(offset)) * self.pixel_du)
-                + ((j as f32 + rng.sample(offset)) * self.pixel_dv);
-            let ray = Ray {
-                transl: self.camera_center,
-                direction: pixel_center - self.camera_center,
-            };
-            pixel_color += scene.ray_color(&ray, MAX_DEPTH) / Self::SAMPLES_PER_PIXEL as f32;
-        }
-        pixel_color
+        let pixel_color = (0..Self::SAMPLES_PER_PIXEL)
+            .into_par_iter()
+            .map(|_| {
+                let mut rng = thread_rng();
+                let pixel_center = self.pixel_origin
+                    + ((i as f32 + rng.sample(offset)) * self.pixel_du)
+                    + ((j as f32 + rng.sample(offset)) * self.pixel_dv);
+                let ray = Ray {
+                    transl: self.camera_center,
+                    direction: pixel_center - self.camera_center,
+                };
+                scene.ray_color(&ray, MAX_DEPTH)
+            })
+            .sum::<Color>();
+        pixel_color / (Self::SAMPLES_PER_PIXEL as f32)
     }
 }
 
@@ -205,7 +192,7 @@ impl Ray {
 }
 
 struct Scene {
-    objects: Vec<Box<dyn Hittable>>,
+    objects: Vec<Box<dyn Hittable + Send + Sync>>,
 }
 impl Scene {
     fn new() -> Self {
@@ -213,7 +200,7 @@ impl Scene {
             objects: Vec::new(),
         }
     }
-    fn add(&mut self, object: impl Hittable + 'static) {
+    fn add(&mut self, object: impl Hittable + Send + Sync + 'static) {
         self.objects.push(Box::new(object));
     }
     fn ray_color(&self, ray: &Ray, depth: u32) -> Color {
@@ -265,7 +252,7 @@ struct Hit {
     transl: Vec3,
     normal: Vec3,
     is_front_face: bool,
-    mat: Rc<dyn Material>,
+    mat: Material,
 }
 trait Hittable {
     fn hit(&self, ray: &Ray, t_min: f32, t_max: f32) -> Option<Hit>;
@@ -274,7 +261,7 @@ trait Hittable {
 struct Sphere {
     transl: Vec3,
     radius: f32,
-    mat: Rc<dyn Material>,
+    mat: Material,
 }
 impl Hittable for Sphere {
     fn hit(&self, ray: &Ray, t_min: f32, t_max: f32) -> Option<Hit> {
@@ -307,105 +294,7 @@ impl Hittable for Sphere {
             transl,
             normal,
             is_front_face,
-            mat: self.mat.clone(),
+            mat: self.mat,
         })
     }
-}
-
-trait Material {
-    fn scatter(&self, ray: &Ray, hit: &Hit) -> (Color, Ray);
-}
-
-struct Lambertian {
-    pub albedo: Vec3,
-}
-impl Material for Lambertian {
-    fn scatter(&self, _ray: &Ray, hit: &Hit) -> (Color, Ray) {
-        let mut scatter_direction = hit.normal + random_unit_vec();
-        if scatter_direction
-            .abs()
-            .cmplt(Vec3::splat(f32::EPSILON))
-            .all()
-        {
-            scatter_direction = hit.normal;
-        }
-        (
-            self.albedo,
-            Ray {
-                transl: hit.transl,
-                direction: scatter_direction,
-            },
-        )
-    }
-}
-
-struct Metallic {
-    albedo: Vec3,
-    fuzz: f32,
-}
-impl Material for Metallic {
-    fn scatter(&self, ray: &Ray, hit: &Hit) -> (Color, Ray) {
-        let reflected_direction = reflect(ray.direction, hit.normal);
-        let reflected_direction = reflected_direction.normalize() + self.fuzz * random_unit_vec();
-        (
-            self.albedo,
-            Ray {
-                transl: hit.transl,
-                direction: reflected_direction,
-            },
-        )
-    }
-}
-
-struct Dielectric {
-    refraction_index: f32,
-}
-impl Material for Dielectric {
-    fn scatter(&self, ray: &Ray, hit: &Hit) -> (Color, Ray) {
-        let refraction_index = if hit.is_front_face {
-            self.refraction_index.recip()
-        } else {
-            self.refraction_index
-        };
-
-        let direction = ray.direction.normalize();
-        let cos_theta = (-direction).dot(hit.normal).min(1.0);
-        let sin_theta = (1.0 - cos_theta * cos_theta).sqrt();
-
-        let must_reflect = refraction_index * sin_theta > 1.0;
-        let mut rng = thread_rng();
-        let proportion = Uniform::new(0.0, 1.0);
-        let refracted_direction =
-            if must_reflect || reflectance(cos_theta, refraction_index) > rng.sample(proportion) {
-                reflect(direction, hit.normal)
-            } else {
-                refract(direction, hit.normal, refraction_index)
-            };
-
-        (
-            WHITE,
-            Ray {
-                transl: hit.transl,
-                direction: refracted_direction,
-            },
-        )
-    }
-}
-
-fn reflect(incident: Vec3, normal: Vec3) -> Vec3 {
-    incident - 2.0 * incident.dot(normal) * normal
-}
-
-fn refract(incident: Vec3, normal: Vec3, refraction_index: f32) -> Vec3 {
-    let cos_theta = (-incident).dot(normal).min(1.0);
-
-    let ray_perpendicular = refraction_index * (incident + cos_theta * normal);
-    let ray_parallel = (1.0 - ray_perpendicular.length_squared()).abs().sqrt() * -normal;
-    ray_perpendicular + ray_parallel
-}
-
-// Schlick's approximation for reflectance
-fn reflectance(cosine: f32, refraction_index: f32) -> f32 {
-    let r0 = ((1.0 - refraction_index) / (1.0 + refraction_index)).powi(2);
-    r0 + (1.0 - r0) * (1.0 - cosine).powi(5)
 }

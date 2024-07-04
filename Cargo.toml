@@ -1,0 +1,16 @@
+[package]
+name = "HelloRaytracing"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+clap = "4.5.8"
+glam = "0.28.0"
+indicatif = "0.17.8"
+itertools = "0.13.0"
+rand = "0.8.5"
+rayon = "1.10.0"
+
+[[bin]]
+name = "HelloRaytracing"
+path = "main.rs"
